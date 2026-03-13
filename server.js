@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' })); 
 
-// 1. Configure Cloudinary with your secrets
+// 1. Configure Cloudinary
 cloudinary.config({ 
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME, 
   api_key: process.env.CLOUDINARY_API_KEY, 
@@ -43,6 +43,15 @@ You must respond strictly with a valid JSON object matching this structure:
 }
 `;
 
+// --- THE FALLBACK ARRAY ---
+// The server will try these in order. If one fails, it moves to the next.
+const fallbackModels = [
+    'gemini-2.5-flash-lite', // The fastest, lightest model (high quota)
+    'gemini-2.5-flash',      // The main model (your current one)
+    'gemini-1.5-flash',      // The older, reliable backup
+    'gemini-1.5-pro'         // The heavy-duty backup
+];
+
 app.post('/api/judge', async (req, res) => {
     try {
         const { image } = req.body;
@@ -51,52 +60,68 @@ app.post('/api/judge', async (req, res) => {
             return res.status(400).json({ error: 'No image provided' });
         }
 
+        console.log("\n--- New Request ---");
         console.log("Saving image to Cloudinary...");
         
-        // 2. Upload the base64 image string to Cloudinary
         const uploadResponse = await cloudinary.uploader.upload(image, {
-            folder: "techfest_outfits", // Groups them in a neat folder on Cloudinary
+            folder: "techfest_outfits", 
         });
         
         const permanentImageUrl = uploadResponse.secure_url;
         console.log("Image saved successfully at:", permanentImageUrl);
 
-        console.log("Sending image to the AI...");
-        
-        const model = genAI.getGenerativeModel({ 
-            model: 'gemini-2.5-flash',
-            generationConfig: {
-                responseMimeType: "application/json",
-            }
-        });
-
-        // Strip the data URL prefix to send pure base64 to Gemini
+        // Strip the data URL prefix
         const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
-
         const imagePart = {
-            inlineData: {
-                data: base64Data,
-                mimeType: "image/jpeg"
-            }
+            inlineData: { data: base64Data, mimeType: "image/jpeg" }
         };
 
-        const result = await model.generateContent([prompt, imagePart]);
-        const responseText = result.response.text();
-        const jsonResponse = JSON.parse(responseText);
+        let jsonResponse = null;
+        let lastError = null;
 
-        // 3. Send the AI score AND the permanent image link back to the frontend
+        // --- THE WATERFALL LOOP ---
+        for (const modelName of fallbackModels) {
+            try {
+                console.log(`Asking AI Model: [${modelName}]...`);
+                
+                const model = genAI.getGenerativeModel({ 
+                    model: modelName,
+                    generationConfig: { responseMimeType: "application/json" }
+                });
+
+                const result = await model.generateContent([prompt, imagePart]);
+                const responseText = result.response.text();
+                jsonResponse = JSON.parse(responseText);
+
+                console.log(`✅ Success with [${modelName}]!`);
+                break; // It worked! Exit the loop immediately.
+
+            } catch (error) {
+                console.warn(`❌ Failed with [${modelName}]. Reason: Quota or API Error.`);
+                lastError = error;
+                // The loop automatically continues to the next model in the array
+            }
+        }
+
+        // If the loop finished and we STILL don't have a response, all models failed.
+        if (!jsonResponse) {
+            console.error("🚨 ALL FALLBACK MODELS FAILED.");
+            throw lastError; // Throw the final error to trigger the catch block below
+        }
+
+        // Send the successful data back to your React frontend
         res.json({
             ...jsonResponse,
             saved_image_url: permanentImageUrl 
         });
 
     } catch (error) {
-        console.error("Error processing the outfit:", error);
-        res.status(500).json({ error: 'Failed to process image' });
+        console.error("Critical Server Error:", error.message);
+        res.status(500).json({ error: 'Failed to process image after all fallbacks.' });
     }
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Server is listening on http://localhost:${PORT}`);
+    console.log(`Server is listening on port ${PORT}`);
 });
